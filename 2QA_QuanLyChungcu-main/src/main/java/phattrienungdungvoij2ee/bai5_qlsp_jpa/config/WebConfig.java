@@ -14,9 +14,21 @@ public class WebConfig implements WebMvcConfigurer {
     public void addResourceHandlers(ResourceHandlerRegistry registry) {
         // Map URL /uploads/** toi thu muc uploads tren may
         Path uploadDir = Paths.get("src/main/resources/static/uploads");
-        String uploadPath = uploadDir.toFile().getAbsolutePath();
+        String uploadPathUri = uploadDir.toUri().toString();
 
         registry.addResourceHandler("/uploads/**")
-                .addResourceLocations("file:" + uploadPath + "/");
+                .addResourceLocations(uploadPathUri);
+
+        // Map URL /images/** sang thu muc static/images o goc project.
+        // De hien thi QR (vd: /images/QR/<ten-file>.jpg).
+        Path imagesDir = Paths.get("static/images");
+        String imagesPathUri = imagesDir.toUri().toString();
+
+        // Fallback theo duong dan workspace hien tai (de tranh truong hop CWD khac thu muc project).
+        Path fallbackImagesDir = Paths.get("E:/WorkPlace/Doan4monFORKED/2QA_PhamTranDangQuang/2QA_QuanLyChungcu-main/static/images");
+        String fallbackImagesPathUri = fallbackImagesDir.toUri().toString();
+
+        registry.addResourceHandler("/images/**")
+                .addResourceLocations("classpath:/static/images/", imagesPathUri, fallbackImagesPathUri);
     }
 }
