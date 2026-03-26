@@ -88,7 +88,7 @@ public class SecurityConfig {
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
         http
                 .authorizeHttpRequests(authorize -> authorize
-                        .requestMatchers("/login", "/register", "/debug", "/css/**", "/js/**", "/uploads/**").permitAll()
+                        .requestMatchers("/login", "/register", "/debug", "/css/**", "/js/**", "/uploads/**", "/images/**").permitAll()
                         .requestMatchers("/thongbao/xem").hasAnyRole("USER", "ADMIN", "MANAGER")
                         .requestMatchers("/thongbao", "/thongbao/**").hasAnyRole("ADMIN", "MANAGER")
                         .requestMatchers("/tintuc", "/tintuc/**").hasAnyRole("USER", "ADMIN", "MANAGER")
