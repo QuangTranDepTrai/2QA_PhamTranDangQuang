@@ -4,6 +4,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import phattrienungdungvoij2ee.bai5_qlsp_jpa.model.*;
 import phattrienungdungvoij2ee.bai5_qlsp_jpa.repository.ApartmentFeeTypeRepository;
+import phattrienungdungvoij2ee.bai5_qlsp_jpa.repository.ApartmentBillDetailRepository;
 import phattrienungdungvoij2ee.bai5_qlsp_jpa.repository.ApartmentMonthlyBillRepository;
 import phattrienungdungvoij2ee.bai5_qlsp_jpa.repository.PaymentRepository;
 import phattrienungdungvoij2ee.bai5_qlsp_jpa.repository.SubscriptionRepository;
@@ -28,6 +29,9 @@ public class ApartmentInvoiceService {
     private ApartmentMonthlyBillRepository billRepository;
 
     @Autowired
+    private ApartmentBillDetailRepository billDetailRepository;
+
+    @Autowired
     private SubscriptionRepository subscriptionRepository;
 
     @Autowired
@@ -48,6 +52,7 @@ public class ApartmentInvoiceService {
         List<ApartmentMonthlyBill> bills = billRepository.findByAccountIdOrderByMonthKeyDesc(user.getId());
         List<InvoiceView> views = new ArrayList<>();
         for (ApartmentMonthlyBill b : bills) {
+            ensureBillDetails(b, user, parseMonth(b.getMonthKey()));
             views.add(toView(b, user));
         }
         views.sort(Comparator.comparing((InvoiceView x) -> x.monthKey).reversed());
@@ -131,7 +136,8 @@ public class ApartmentInvoiceService {
                 b.setMonthKey(monthKey);
                 b.setStatus("CHUA_THANH_TOAN");
                 b.setDueDate(cursor.atDay(10)); // Han dong den ngay 10 hang thang
-                billRepository.save(b);
+                ApartmentMonthlyBill saved = billRepository.save(b);
+                ensureBillDetails(saved, user, cursor);
             }
             cursor = cursor.plusMonths(1);
         }
@@ -154,7 +160,25 @@ public class ApartmentInvoiceService {
 
     private InvoiceView toView(ApartmentMonthlyBill bill, Account user) {
         YearMonth ym = parseMonth(bill.getMonthKey());
-        BigDecimal apartmentFee = calculateApartmentFee(user, ym);
+        List<ApartmentBillDetail> details = billDetailRepository.findByBillIdOrderByIdAsc(bill.getId());
+        List<DetailView> detailViews = new ArrayList<>();
+        BigDecimal apartmentFee = BigDecimal.ZERO;
+        BigDecimal totalDetailAmount = BigDecimal.ZERO;
+        for (ApartmentBillDetail d : details) {
+            BigDecimal amt = (d.getAmount() == null) ? BigDecimal.ZERO : d.getAmount();
+            totalDetailAmount = totalDetailAmount.add(amt);
+            if ("APARTMENT_FEE".equals(d.getLineType())) {
+                apartmentFee = apartmentFee.add(amt);
+            }
+            detailViews.add(new DetailView(
+                    d.getLineType(),
+                    d.getTitle(),
+                    d.getQuantity(),
+                    d.getUnitPrice(),
+                    amt,
+                    d.getNote()
+            ));
+        }
         ServiceFeeInfo serviceFee = calculateServiceFee(user, ym);
 
         BigDecimal baseDebt = apartmentFee.add(serviceFee.unpaidServiceAmount);
@@ -197,43 +221,94 @@ public class ApartmentInvoiceService {
                 due,
                 status,
                 days,
-                apartmentFee.add(serviceFee.totalServiceAmount),
+                totalDetailAmount,
                 penalty,
-                total
+                total,
+                detailViews
         );
     }
 
-    private BigDecimal calculateApartmentFee(Account user, YearMonth ym) {
-        List<ApartmentFeeType> feeTypes = feeTypeRepository.findByActiveTrueOrderBySortOrderAsc();
-        if (feeTypes == null || feeTypes.isEmpty()) {
-            return BigDecimal.ZERO;
+    private void ensureBillDetails(ApartmentMonthlyBill bill, Account user, YearMonth ym) {
+        if (bill == null || user == null || ym == null) {
+            return;
         }
+        List<ApartmentBillDetail> existing = billDetailRepository.findByBillIdOrderByIdAsc(bill.getId());
+        if (existing != null && !existing.isEmpty()) {
+            return;
+        }
+
+        List<ApartmentBillDetail> toSave = new ArrayList<>();
+        List<ApartmentFeeType> feeTypes = feeTypeRepository.findByActiveTrueOrderBySortOrderAsc();
         BigDecimal apartmentPrice = BigDecimal.valueOf(user.getChungCu() != null ? user.getChungCu().getPrice() : 0L);
         YearMonth start = detectStartMonth(user);
         boolean isStartMonth = ym.equals(start);
 
-        BigDecimal sum = BigDecimal.ZERO;
         for (ApartmentFeeType ft : feeTypes) {
             if (ft == null) {
                 continue;
             }
             String timing = ft.getChargeTiming();
             String code = ft.getCode();
+            BigDecimal amount = BigDecimal.ZERO;
 
             if ("HANG_THANG".equals(timing)) {
-                sum = sum.add(monthlyAmountByCode(code));
+                amount = monthlyAmountByCode(code);
+            } else if (isStartMonth && ("KHI_MUA".equals(timing) || "KHI_MUA_BAN".equals(timing))) {
+                amount = oneTimeAmountByCode(code, apartmentPrice);
+            }
+
+            if (amount.compareTo(BigDecimal.ZERO) <= 0) {
                 continue;
             }
-            if (isStartMonth && ("KHI_MUA".equals(timing) || "KHI_MUA_BAN".equals(timing))) {
-                sum = sum.add(oneTimeAmountByCode(code, apartmentPrice));
-            }
+
+            ApartmentBillDetail d = new ApartmentBillDetail();
+            d.setBill(bill);
+            d.setLineType("APARTMENT_FEE");
+            d.setFeeType(ft);
+            d.setTitle(ft.getName());
+            d.setQuantity(BigDecimal.ONE);
+            d.setUnitPrice(amount);
+            d.setAmount(amount);
+            d.setNote(ft.getCalcMethod());
+            toSave.add(d);
         }
-        return sum;
+
+        List<Payment> payments = paymentRepository.findBySubscriptionUserId(user.getId());
+        for (Payment p : payments) {
+            if (p == null || p.getSubscription() == null || p.getSubscription().getCreatedAt() == null) {
+                continue;
+            }
+            YearMonth pym = YearMonth.from(p.getSubscription().getCreatedAt().toLocalDate());
+            if (!ym.equals(pym)) {
+                continue;
+            }
+            BigDecimal amount = (p.getAmount() == null) ? BigDecimal.ZERO : p.getAmount();
+            if (amount.compareTo(BigDecimal.ZERO) <= 0) {
+                continue;
+            }
+            ApartmentBillDetail d = new ApartmentBillDetail();
+            d.setBill(bill);
+            d.setLineType("SERVICE");
+            if (p.getSubscription().getServiceEntity() != null) {
+                d.setService(p.getSubscription().getServiceEntity());
+                d.setTitle(p.getSubscription().getServiceEntity().getName());
+            } else {
+                d.setTitle("Phí dịch vụ");
+            }
+            d.setQuantity(BigDecimal.ONE);
+            d.setUnitPrice(amount);
+            d.setAmount(amount);
+            d.setNote(String.format("Trang thai: %s", p.getStatus()));
+            toSave.add(d);
+        }
+
+        if (!toSave.isEmpty()) {
+            billDetailRepository.saveAll(toSave);
+        }
     }
 
     private ServiceFeeInfo calculateServiceFee(Account user, YearMonth ym) {
         List<Payment> payments = paymentRepository.findBySubscriptionUserId(user.getId());
-        BigDecimal totalService = BigDecimal.ZERO;
         BigDecimal unpaidService = BigDecimal.ZERO;
         boolean hasUnpaid = false;
 
@@ -246,13 +321,12 @@ public class ApartmentInvoiceService {
                 continue;
             }
             BigDecimal amount = p.getAmount() == null ? BigDecimal.ZERO : p.getAmount();
-            totalService = totalService.add(amount);
             if (!"DA_THANH_TOAN".equals(p.getStatus())) {
                 unpaidService = unpaidService.add(amount);
                 hasUnpaid = true;
             }
         }
-        return new ServiceFeeInfo(totalService, unpaidService, hasUnpaid);
+        return new ServiceFeeInfo(unpaidService, hasUnpaid);
     }
 
     private BigDecimal monthlyAmountByCode(String code) {
@@ -304,12 +378,10 @@ public class ApartmentInvoiceService {
     }
 
     private static class ServiceFeeInfo {
-        final BigDecimal totalServiceAmount;
         final BigDecimal unpaidServiceAmount;
         final boolean hasUnpaidService;
 
-        ServiceFeeInfo(BigDecimal totalServiceAmount, BigDecimal unpaidServiceAmount, boolean hasUnpaidService) {
-            this.totalServiceAmount = totalServiceAmount;
+        ServiceFeeInfo(BigDecimal unpaidServiceAmount, boolean hasUnpaidService) {
             this.unpaidServiceAmount = unpaidServiceAmount;
             this.hasUnpaidService = hasUnpaidService;
         }
@@ -324,9 +396,11 @@ public class ApartmentInvoiceService {
         public final BigDecimal monthAmount;
         public final BigDecimal penalty;
         public final BigDecimal totalToPay;
+        public final List<DetailView> details;
 
         public InvoiceView(String monthKey, String monthDisplay, LocalDate dueFinalDate, String status,
-                           long daysLeftOrOverdue, BigDecimal monthAmount, BigDecimal penalty, BigDecimal totalToPay) {
+                           long daysLeftOrOverdue, BigDecimal monthAmount, BigDecimal penalty, BigDecimal totalToPay,
+                           List<DetailView> details) {
             this.monthKey = monthKey;
             this.monthDisplay = monthDisplay;
             this.dueFinalDate = dueFinalDate;
@@ -335,6 +409,25 @@ public class ApartmentInvoiceService {
             this.monthAmount = monthAmount;
             this.penalty = penalty;
             this.totalToPay = totalToPay;
+            this.details = details;
+        }
+    }
+
+    public static class DetailView {
+        public final String lineType;
+        public final String title;
+        public final BigDecimal quantity;
+        public final BigDecimal unitPrice;
+        public final BigDecimal amount;
+        public final String note;
+
+        public DetailView(String lineType, String title, BigDecimal quantity, BigDecimal unitPrice, BigDecimal amount, String note) {
+            this.lineType = lineType;
+            this.title = title;
+            this.quantity = quantity;
+            this.unitPrice = unitPrice;
+            this.amount = amount;
+            this.note = note;
         }
     }
 
